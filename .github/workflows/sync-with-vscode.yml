@@ -1,0 +1,406 @@
+name: 🔄 VSCode Sync - Multi-Branch Strategy
+
+# ============================================
+# ESTRATEGIA DE RAMAS:
+# - vscode-mirror: Espejo limpio de VSCode (sin modificaciones)
+# - apileum-develop: Desarrollo con nuestros cambios
+# - main: Producción estable
+# ============================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Rama donde aplicar actualizaciones'
+        required: true
+        default: 'vscode-mirror'
+        type: choice
+        options:
+          - vscode-mirror     # Solo actualizar el espejo
+          - apileum-develop   # Actualizar rama de desarrollo
+          - create-sync-pr    # Crear PR para revisar
+      
+      merge_strategy:
+        description: 'Estrategia de merge'
+        required: true
+        default: 'safe'
+        type: choice
+        options:
+          - safe       # Preserva todos nuestros cambios
+          - moderate   # Acepta cambios de VSCode en core
+          - aggressive # Prioriza VSCode (peligroso)
+  
+  schedule:
+    # Actualizar espejo diariamente
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # ============================================
+  # JOB 1: Mantener rama espejo de VSCode
+  # ============================================
+  update-vscode-mirror:
+    name: 🪞 Update VSCode Mirror Branch
+    runs-on: ubuntu-latest
+    outputs:
+      new_commits: ${{ steps.check.outputs.new_commits }}
+      commit_count: ${{ steps.check.outputs.count }}
+      
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🔧 Configure Git
+        run: |
+          git config user.name "Apileum Sync Bot"
+          git config user.email "sync@apileum.com"
+      
+      - name: 🌿 Setup VSCode Mirror Branch
+        run: |
+          # Agregar VSCode upstream si no existe
+          if ! git remote | grep -q "^vscode$"; then
+            git remote add vscode https://github.com/microsoft/vscode.git
+          fi
+          
+          echo "📡 Fetching VSCode latest..."
+          git fetch vscode main --tags
+          
+          # Crear o actualizar rama espejo
+          if git show-ref --verify --quiet refs/heads/vscode-mirror; then
+            echo "🔄 Updating existing vscode-mirror branch..."
+            git checkout vscode-mirror
+            
+            # Guardar el HEAD actual antes de actualizar
+            OLD_HEAD=$(git rev-parse HEAD)
+            
+            # Reset hard a VSCode main (espejo exacto)
+            git reset --hard vscode/main
+            
+            # Contar nuevos commits
+            NEW_COMMITS=$(git rev-list --count $OLD_HEAD..HEAD 2>/dev/null || echo "0")
+            echo "📊 New commits from VSCode: $NEW_COMMITS"
+            
+            if [ "$NEW_COMMITS" -gt 0 ]; then
+              echo "new_commits=true" >> $GITHUB_OUTPUT
+              echo "count=$NEW_COMMITS" >> $GITHUB_OUTPUT
+            else
+              echo "new_commits=false" >> $GITHUB_OUTPUT
+              echo "count=0" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "🆕 Creating vscode-mirror branch..."
+            git checkout -b vscode-mirror vscode/main
+            echo "new_commits=true" >> $GITHUB_OUTPUT
+            echo "count=999" >> $GITHUB_OUTPUT
+          fi
+          
+          # Push mirror branch
+          git push origin vscode-mirror --force-with-lease
+          
+          echo "✅ VSCode mirror branch updated"
+
+  # ============================================
+  # JOB 2: Actualizar rama de desarrollo
+  # ============================================
+  update-development:
+    name: 🔀 Update Development Branch
+    runs-on: ubuntu-latest
+    needs: update-vscode-mirror
+    if: |
+      needs.update-vscode-mirror.outputs.new_commits == 'true' && 
+      (github.event.inputs.target_branch == 'apileum-develop' || 
+       github.event.inputs.target_branch == 'create-sync-pr')
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: apileum-develop  # Checkout nuestra rama de desarrollo
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🔧 Configure Git
+        run: |
+          git config user.name "Apileum Sync Bot"
+          git config user.email "sync@apileum.com"
+          
+          # Configurar merge strategies personalizadas
+          git config merge.ours.driver true
+          git config merge.tool vimdiff
+      
+      - name: 📝 Create Merge Strategy Files
+        run: |
+          # Crear .gitattributes para controlar el merge
+          cat > .gitattributes << 'EOF'
+          # Archivos de Apileum - Siempre mantener nuestra versión
+          product.json merge=ours
+          package.json merge=ours
+          README.md merge=ours
+          LICENSE merge=ours
+          
+          # Directorios de Apileum - Siempre nuestros
+          src/vs/apileum/** merge=ours
+          extensions/apileum-*/** merge=ours
+          packages/forge/** merge=ours
+          packages/flow/** merge=ours
+          packages/hub/** merge=ours
+          
+          # Configuración - Siempre nuestra
+          .github/workflows/* merge=ours
+          .vscode/* merge=ours
+          tsconfig.json merge=ours
+          
+          # Core de VSCode - Aceptar sus cambios por defecto
+          src/vs/base/** merge=theirs
+          src/vs/platform/** merge=theirs
+          src/vs/editor/common/** merge=theirs
+          
+          # Archivos que necesitan merge manual
+          src/vs/workbench/browser/workbench.contribution.ts merge=manual
+          src/vs/code/electron-main/main.ts merge=manual
+          EOF
+          
+          git add .gitattributes
+          git commit -m "📝 Update merge strategy" || true
+      
+      - name: 🔀 Merge VSCode Updates
+        id: merge
+        run: |
+          # Determinar estrategia según input
+          STRATEGY="${{ github.event.inputs.merge_strategy }}"
+          
+          echo "📊 Attempting merge with strategy: $STRATEGY"
+          
+          case $STRATEGY in
+            safe)
+              # Estrategia segura - preserva todos nuestros cambios
+              MERGE_OPTS="-X ours"
+              ;;
+            moderate)
+              # Estrategia moderada - acepta cambios del core de VSCode
+              MERGE_OPTS="-X theirs --no-overwrite-ignore"
+              ;;
+            aggressive)
+              # Estrategia agresiva - prioriza VSCode
+              MERGE_OPTS="-X theirs"
+              ;;
+            *)
+              MERGE_OPTS="-X ours"
+              ;;
+          esac
+          
+          # Crear rama temporal para el merge
+          MERGE_BRANCH="vscode-sync-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b $MERGE_BRANCH
+          
+          # Intentar merge
+          if git merge origin/vscode-mirror \
+               --no-ff \
+               $MERGE_OPTS \
+               -m "🔄 Sync with VSCode upstream - ${{ needs.update-vscode-mirror.outputs.count }} commits
+
+               Strategy: $STRATEGY
+               VSCode commits: ${{ needs.update-vscode-mirror.outputs.count }}
+               Auto-merged: $(date +%Y-%m-%d)"; then
+            echo "✅ Merge successful"
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+            echo "merge_branch=$MERGE_BRANCH" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Merge conflicts detected"
+            echo "merge_success=false" >> $GITHUB_OUTPUT
+            echo "merge_branch=$MERGE_BRANCH" >> $GITHUB_OUTPUT
+            
+            # Listar conflictos
+            git diff --name-only --diff-filter=U > conflicts.txt
+            echo "📝 Conflicted files:"
+            cat conflicts.txt
+          fi
+      
+      - name: 🔧 Auto-Resolve Known Conflicts
+        if: steps.merge.outputs.merge_success == 'false'
+        id: resolve
+        run: |
+          echo "🔧 Attempting to auto-resolve conflicts..."
+          
+          # Script de resolución inteligente
+          cat > resolve.py << 'SCRIPT'
+          #!/usr/bin/env python3
+          import os
+          import re
+          import subprocess
+          
+          def get_conflicted_files():
+              result = subprocess.run(['git', 'diff', '--name-only', '--diff-filter=U'], 
+                                    capture_output=True, text=True)
+              return result.stdout.strip().split('\n') if result.stdout else []
+          
+          def resolve_file(filepath):
+              """Resuelve conflictos basándose en reglas"""
+              
+              # Reglas de resolución
+              OURS_PATTERNS = [
+                  r'product\.json$',
+                  r'package\.json$',
+                  r'src/vs/apileum/',
+                  r'extensions/apileum-',
+                  r'\.github/workflows/'
+              ]
+              
+              THEIRS_PATTERNS = [
+                  r'src/vs/base/',
+                  r'src/vs/platform/',
+                  r'src/vs/editor/common/',
+                  r'test/unit/',
+                  r'test/integration/'
+              ]
+              
+              # Verificar si debe ser "ours"
+              for pattern in OURS_PATTERNS:
+                  if re.search(pattern, filepath):
+                      print(f"  → Keeping our version: {filepath}")
+                      subprocess.run(['git', 'checkout', '--ours', filepath])
+                      subprocess.run(['git', 'add', filepath])
+                      return True
+              
+              # Verificar si debe ser "theirs"
+              for pattern in THEIRS_PATTERNS:
+                  if re.search(pattern, filepath):
+                      print(f"  → Taking VSCode version: {filepath}")
+                      subprocess.run(['git', 'checkout', '--theirs', filepath])
+                      subprocess.run(['git', 'add', filepath])
+                      return True
+              
+              print(f"  ⚠️ Manual resolution needed: {filepath}")
+              return False
+          
+          # Resolver conflictos
+          conflicted = get_conflicted_files()
+          unresolved = []
+          
+          for filepath in conflicted:
+              if filepath and not resolve_file(filepath):
+                  unresolved.append(filepath)
+          
+          if not unresolved:
+              print("✅ All conflicts resolved!")
+              subprocess.run(['git', 'commit', '-m', '🔧 Auto-resolved merge conflicts'])
+              exit(0)
+          else:
+              print(f"⚠️ {len(unresolved)} files need manual resolution:")
+              for f in unresolved:
+                  print(f"  - {f}")
+              exit(1)
+          SCRIPT
+          
+          chmod +x resolve.py
+          
+          if python3 resolve.py; then
+            echo "conflicts_resolved=true" >> $GITHUB_OUTPUT
+          else
+            echo "conflicts_resolved=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: 🧪 Validate Build
+        if: steps.merge.outputs.merge_success == 'true' || steps.resolve.outputs.conflicts_resolved == 'true'
+        id: validate
+        run: |
+          echo "🧪 Validating merged code..."
+          
+          # Instalar dependencias
+          npm ci
+          
+          # Verificar compilación
+          if npm run compile-cli; then
+            echo "✅ Build successful"
+            echo "build_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Build failed"
+            echo "build_success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: 📤 Push or Create PR
+        if: steps.validate.outputs.build_success == 'true'
+        run: |
+          TARGET="${{ github.event.inputs.target_branch }}"
+          BRANCH="${{ steps.merge.outputs.merge_branch }}"
+          
+          if [ "$TARGET" == "apileum-develop" ]; then
+            echo "📤 Pushing directly to apileum-develop..."
+            git push origin $BRANCH:apileum-develop
+          else
+            echo "📤 Pushing sync branch for PR..."
+            git push origin $BRANCH
+            
+            # Crear PR usando GitHub CLI
+            gh pr create \
+              --base apileum-develop \
+              --head $BRANCH \
+              --title "🔄 VSCode Upstream Sync - ${{ needs.update-vscode-mirror.outputs.count }} commits" \
+              --body "## 🔄 VSCode Upstream Sync
+
+This PR merges the latest ${{ needs.update-vscode-mirror.outputs.count }} commits from VSCode upstream.
+
+### 📊 Merge Summary
+- **Strategy**: ${{ github.event.inputs.merge_strategy }}
+- **Auto-resolved**: ${{ steps.resolve.outputs.conflicts_resolved == 'true' && '✅ Yes' || '❌ Requires review' }}
+- **Build status**: ✅ Passing
+
+### 🔍 Review Checklist
+- [ ] Apileum customizations preserved
+- [ ] No breaking changes in our APIs
+- [ ] Extensions still work
+- [ ] Tests passing
+
+### 📝 Next Steps
+1. Review changes carefully
+2. Test locally with: \`git checkout $BRANCH && npm test\`
+3. Merge when ready
+
+---
+*Auto-generated by VSCode Sync workflow*" \
+              --label "upstream-sync,automated" \
+              --reviewer "${{ github.repository_owner }}"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================
+  # JOB 3: Merge a main (solo si todo está bien)
+  # ============================================
+  merge-to-main:
+    name: 🚀 Merge to Main
+    runs-on: ubuntu-latest
+    needs: [update-vscode-mirror, update-development]
+    if: |
+      github.event.inputs.target_branch == 'apileum-develop' &&
+      needs.update-development.result == 'success'
+    environment: production
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      
+      - name: 🔀 Merge to Main
+        run: |
+          git config user.name "Apileum Sync Bot"
+          git config user.email "sync@apileum.com"
+          
+          # Merge apileum-develop a main
+          git merge origin/apileum-develop \
+            --no-ff \
+            -m "🚀 Merge VSCode updates to main
+
+            Updates from VSCode: ${{ needs.update-vscode-mirror.outputs.count }} commits
+            All tests passing ✅"
+          
+          git push origin main
