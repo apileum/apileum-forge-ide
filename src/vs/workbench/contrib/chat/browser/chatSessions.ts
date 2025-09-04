@@ -156,6 +156,10 @@ function getSessionItemContextOverlay(
 	editorGroupsService?: IEditorGroupsService
 ): [string, any][] {
 	const overlay: [string, any][] = [];
+	// Do not create an overaly for the show-history node
+	if (session.id === 'show-history') {
+		return overlay;
+	}
 	if (provider) {
 		overlay.push([ChatContextKeys.sessionType.key, provider.chatSessionType]);
 	}
@@ -1532,7 +1536,16 @@ class SessionsViewPane extends ViewPane {
 		const renderer = this.instantiationService.createInstance(SessionsRenderer, labels);
 		this._register(renderer);
 
-		const getResourceForElement = (element: ChatSessionItemWithProvider): URI => {
+		const getResourceForElement = (element: ChatSessionItemWithProvider): URI | null => {
+			if (this.isLocalChatSessionItem(element)) {
+				return null;
+			}
+
+			if (element.provider.chatSessionType === 'local') {
+				const actualSessionId = element.id.startsWith('history-') ? element.id.substring('history-'.length) : element.id;
+				return ChatSessionUri.forSession(element.provider.chatSessionType, actualSessionId);
+			}
+
 			return ChatSessionUri.forSession(element.provider.chatSessionType, element.id);
 		};
 
@@ -1558,7 +1571,7 @@ class SessionsViewPane extends ViewPane {
 						if (element.id === historyNode.id) {
 							return null;
 						}
-						return getResourceForElement(element).toString();
+						return getResourceForElement(element)?.toString() ?? null;
 					},
 					getDragLabel: (elements: ChatSessionItemWithProvider[]) => {
 						if (elements.length === 1) {
@@ -1690,6 +1703,7 @@ class SessionsViewPane extends ViewPane {
 						pinned: true,
 						// Add a marker to indicate this session was opened from history
 						ignoreInView: true,
+						preserveFocus: true,
 					};
 					await this.editorService.openEditor({ resource: ChatEditorInput.getNewEditorUri(), options });
 				} else {
@@ -1697,8 +1711,8 @@ class SessionsViewPane extends ViewPane {
 					const providerType = sessionWithProvider.provider.chatSessionType;
 					const options: IChatEditorOptions = {
 						pinned: true,
-						preferredTitle: truncate(element.label, 20)
-
+						preferredTitle: truncate(element.label, 20),
+						preserveFocus: true,
 					};
 					await this.editorService.openEditor({
 						resource: ChatSessionUri.forSession(providerType, sessionId),
@@ -1733,6 +1747,7 @@ class SessionsViewPane extends ViewPane {
 				pinned: true,
 				ignoreInView: true,
 				preferredTitle: truncate(element.label, 20),
+				preserveFocus: true,
 			};
 			await this.editorService.openEditor({
 				resource: ChatSessionUri.forSession(providerType, sessionId),
